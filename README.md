@@ -294,3 +294,353 @@ prefix部分代码会与原有模型产生冲突，因此更换模型。
 | prefix    | 0.77  |
 
 
+## 4. 高级训练策略
+### 3.1 Unsloth 优化框架实践
+Unsloth 是一个专为高效微调大型语言模型（LLMs）而设计的开源优化框架，其核心目标是显著提升训练速度并降低显存消耗，同时不牺牲模型的性能。
+
+核心特性与工作原理：
+
+1.手动融合内核
+
+问题：标准的 PyTorch 操作（如矩阵乘法、LayerNorm、SiLU 激活函数等）会启动多个独立的内核，导致大量的内存读写开销和内核启动开销。
+
+Unsloth 的解决方案：它将多个连续的操作（如：Q * K^T + 掩码 -> Softmax -> 注意力权重 * V）融合成一个单一的、高度优化的 CUDA 内核。这极大地减少了 GPU 内存的读写次数和内核启动次数，从而成为速度提升的关键。
+
+2.更快的自动微分
+
+Unsloth 重写了反向传播过程，针对其融合后的前向传播内核，实现了更高效、更快速的梯度计算。
+
+3.内存优化
+
+通过一系列技术（如智能梯度检查点、高效的内存管理）来降低训练过程中的峰值显存占用，使得在消费级显卡（如 RTX 3090/4090）上微调大模型成为可能。
+
+4.与 PEFT 的无缝集成
+
+Unsloth 原生支持 LoRA、QLoRA 等参数高效微调方法，并与 Hugging Face Transformers 库完全兼容，用户只需修改几行代码即可享受到优化
+
+~~~
+ model = FastModel.get_peft_model(
+        model,
+        r=16,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        # target_modules=[
+        #     "q_proj", "k_proj", "v_proj", "o_proj",
+        #     "gate_proj", "up_proj", "down_proj", ],
+        lora_alpha=32,
+        lora_dropout=0,  # Supports any, but = 0 is optimized
+        bias="none",  # Supports any, but = "none" is optimized
+        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+        use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
+        random_state=3407,
+        use_rslora=False,  # We support rank stabilized LoRA
+        loftq_config=None,  # And LoftQ
+        task_type="SEQ_CLS",
+    )
+~~~
+
+
+
+
+### 3.2. R-Drop 正则化技术
+
+**R-Drop** 是一种通过**约束模型随机性**来提升泛化能力的正则化技术。其核心思想是：对于相同的输入，模型在不同 Dropout 掩码下的输出应该是一致的。
+
+**核心思想：**
+*   Dropout 在训练时随机关闭一部分神经元，导致同一个输入在两次前向传播中会经过略有不同的子网络，从而产生两个不同的输出分布。
+*   R-Drop 认为，一个鲁棒的模型对于同一个输入，无论经过哪个随机的子网络，其预测结果都应该是一致的。
+
+**工作原理与实现：**
+1.  **两次前向传播**：对于同一个训练样本，在一个训练步内进行两次前向传播，每次使用不同的 Dropout 掩码。这会得到两个预测输出分布 \(P_1\) 和 \(P_2\)。
+2.  **构建损失函数**：总损失由三部分组成：
+    *   **任务损失1**：计算 \(P_1\) 与真实标签的交叉熵损失 \(L_{CE}^{1}\)。
+    *   **任务损失2**：计算 \(P_2\) 与真实标签的交叉熵损失 \(L_{CE}^{2}\)。
+    *   **一致性损失**：计算 \(P_1\) 和 \(P_2\) 之间的双向 KL 散度，以约束它们的一致性。
+        \(L_{KL} = \frac{1}{2} [KL(P_1 || P_2) + KL(P_2 || P_1)]\)
+3.  **总损失**：\(L_{total} = L_{CE}^{1} + L_{CE}^{2} + \alpha * L_{KL}\)
+    其中，\(\alpha\) 是一个超参数，用于控制一致性损失的权重。
+
+**优势：**
+*   **提升泛化能力**：通过一致性约束，迫使模型学习更本质、更鲁棒的特征，减少对特定神经元路径的依赖，有效防止过拟合。
+*   **即插即用**：实现简单，只需在训练循环中增加一次前向传播和 KL 散度计算，无需修改模型结构。
+*   **通用性强**：可广泛应用于分类、生成等多种任务。
+
+[参考论文](https://arxiv.org/abs/2106.14448) 
+![alt text](rdrop-1.png)
+
+继承Huggingface的BertPreTrainedModel重写forward方法：
+~~~
+class BertScratch(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.config = config
+
+        self.bert = BertModel(config)
+        classifier_dropout = (
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        )
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.post_init()
+
+    # === 修改点：增加了 **kwargs 以接收 inputs_embeds 等额外参数 ===
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, **kwargs):
+        # 第一次前向传播
+        outputs = self.bert(input_ids, attention_mask, token_type_ids)
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+            # === R-Drop 逻辑 ===
+            if self.training:
+                kl_outputs = self.bert(input_ids, attention_mask, token_type_ids)
+                kl_output = kl_outputs[1]
+                kl_output = self.dropout(kl_output)
+                kl_logits = self.classifier(kl_output)
+
+                ce_loss = loss_fct(kl_logits.view(-1, self.num_labels), labels.view(-1))
+                
+                alpha = 1.0 
+                kl_loss = (KL(logits, kl_logits, "sum") + KL(kl_logits, logits, "sum")) / 2.
+                
+                total_loss = loss + ce_loss + alpha * kl_loss
+                loss = total_loss
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions
+        )
+~~~
+
+配置并挂载 LoRA
+~~~
+peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS, 
+        inference_mode=False, 
+        r=8,             
+        lora_alpha=32,   
+        lora_dropout=0.1,
+        target_modules=["query", "value"] 
+    )
+    
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+
+    metric = evaluate.load("accuracy")
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=-1)
+        return metric.compute(predictions=predictions, references=labels)
+
+    training_args = TrainingArguments(
+        output_dir='./checkpoint_lora',
+        num_train_epochs=3,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        warmup_steps=500,
+        learning_rate=2e-4, 
+        weight_decay=0.01,
+        logging_dir='./logs',
+        logging_steps=100,
+        report_to="none",
+        save_strategy="no",
+        eval_strategy="epoch",
+        remove_unused_columns=False,
+        label_names=["labels"] # 显式指定 label_names 消除警告
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+~~~
+
+
+---
+
+### 3.3 监督对比学习
+
+对比学习的核心思想是：在表示空间中，**拉近正样本对的距离，推远负样本对的距离**。监督对比学习将这一思想与标签信息相结合。
+
+**核心思想：**
+*   **无监督对比学习**：正样本通常是同一数据的不同增强视图（如，同一张图片的两次随机裁剪），负样本是批次中的其他所有样本。
+*   **监督对比学习**：利用真实的标签信息来定义正负样本。**同一个类别的样本互为正样本，不同类别的样本互为负样本。**
+
+**工作原理与实现：**
+1.  **构建批次**：在一个训练批次中，包含多个类别，每个类别有多个样本。
+2.  **特征提取**：将样本输入模型，得到其归一化后的特征向量 \(z_i\)。
+3.  **计算损失**：对于每个样本（锚点）：
+    *   **正样本**：批次中所有与锚点同类别的其他样本。
+    *   **负样本**：批次中所有与锚点不同类别的样本。
+    *   监督对比损失鼓励锚点与所有正样本的相似度远高于与所有负样本的相似度。
+
+**损失函数：**
+\[
+\mathcal{L}_{supcon} = \sum_{i=1}^{N} \frac{-1}{|P(i)|} \sum_{p \in P(i)} \log \frac{\exp(z_i \cdot z_p / \tau)}{\sum_{a \in A(i)} \exp(z_i \cdot z_a / \tau)}
+\]
+*   \(P(i)\)：是锚点 \(i\) 的所有正样本的集合。
+*   \(A(i)\)：是锚点 \(i\) 之外的所有样本的集合。
+*   \(\tau\)：是温度参数，用于调节分布的尖锐程度。
+*   \( |P(i)| \) 用于归一化，确保每个锚点的损失不会被其正样本数量所主导。
+
+**优势：**
+*   **学习更好的特征表示**：它能够学习到**类内紧凑、类间分离**的特征空间，即同一类的样本特征聚集在一起，不同类的样本特征彼此远离。
+*   **增强模型判别能力**：这种特征结构使得决策边界更加清晰，提高了模型的分类性能和对噪声的鲁棒性。
+*   **与交叉熵损失互补**：监督对比学习侧重于样本间的相对关系，而交叉熵损失侧重于绝对分类。在实践中，常将两种损失结合使用，如您的项目中所做：\(L_{total} = L_{CE} + \beta * L_{SupCon}\)。
+[参考论文](https://arxiv.org/abs/2004.11362)
+
+继承Huggingface的BertPreTrainedModel重写forward方法：
+~~~
+class BertScratch(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.config = config
+        self.alpha = 0.1 # 稍微降低 SCL Loss 权重，避免主导
+
+        self.bert = BertModel(config)
+        classifier_dropout = (
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        )
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        
+        self.scl_fct = SupConLoss(temperature=0.07) 
+        self.post_init()
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, **kwargs):
+        outputs = self.bert(input_ids, attention_mask, token_type_ids)
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            ce_loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            
+            if self.training:
+                # === 关键修复: 对特征进行 L2 归一化 ===
+                # 对比学习必须使用归一化的向量，否则点积会爆炸导致 Loss NaN
+                normed_features = F.normalize(pooled_output, dim=1).unsqueeze(1)
+                
+                scl_loss = self.scl_fct(normed_features, labels)
+                loss = ce_loss + self.alpha * scl_loss
+            else:
+                loss = ce_loss
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions
+        )
+~~~
+
+
+损失函数：
+~~~
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...], at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # Compute logits
+        anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.temperature)
+        
+        # Numerical stability check
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # Tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        
+        # Mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device), 0
+        )
+        mask = mask * logits_mask
+
+        # Compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8) # Add epsilon
+
+        # Compute mean of log-likelihood over positive
+        # === 关键修复: 分母加 1e-8 防止除以 0 (当 Batch 内只有自身一个类别时) ===
+        mask_pos_pairs = mask.sum(1)
+        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, torch.ones_like(mask_pos_pairs), mask_pos_pairs)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_pos_pairs
+
+        # Loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+        return loss
+~~~
+
+
+### 总结对比
+
+| 技术 | 核心目标 | 核心思想 | 优势 |
+| :--- | :--- | :--- | :--- |
+| **Unsloth** | **提升训练效率** | 通过内核融合、内存优化等手段，加速训练并降低显存消耗。 | 训练速度显著提升，硬件门槛降低，易于使用。 |
+| **R-Drop** | **提升模型鲁棒性** | 强制模型对不同Dropout子网络下的同一输入产生一致输出。 | 有效防止过拟合，提升泛化能力，即插即用。 |
+| **监督对比学习** | **学习优质特征表示** | 利用标签信息，在特征空间拉近同类样本、推远异类样本。 | 特征更具判别性，决策边界更清晰，模型更鲁棒。 |
+
+
+## 各模型准确率
+| 模型         | 准确率   |
+|--------------|----------|
+| deberta_unsloth    | 0.95068 |
+|ModernBERT_unsloth | 0.95860  |
+| bert_scratch_lora      | 0.92396 |
+| bert_scl_lora    | 0.92092  |
