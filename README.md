@@ -295,7 +295,7 @@ prefix部分代码会与原有模型产生冲突，因此更换模型。
 
 
 ## 4. 高级训练策略
-### 3.1 Unsloth 优化框架实践
+### 4.1 Unsloth 优化框架实践
 Unsloth 是一个专为高效微调大型语言模型（LLMs）而设计的开源优化框架，其核心目标是显著提升训练速度并降低显存消耗，同时不牺牲模型的性能。
 
 核心特性与工作原理：
@@ -340,7 +340,7 @@ Unsloth 原生支持 LoRA、QLoRA 等参数高效微调方法，并与 Hugging F
 
 
 
-### 3.2. R-Drop 正则化技术
+### 4.2. R-Drop 正则化技术
 
 **R-Drop** 是一种通过**约束模型随机性**来提升泛化能力的正则化技术。其核心思想是：对于相同的输入，模型在不同 Dropout 掩码下的输出应该是一致的。
 
@@ -473,7 +473,7 @@ peft_config = LoraConfig(
 
 ---
 
-### 3.3 监督对比学习
+### 4.3 监督对比学习
 
 对比学习的核心思想是：在表示空间中，**拉近正样本对的距离，推远负样本对的距离**。监督对比学习将这一思想与标签信息相结合。
 
@@ -644,3 +644,66 @@ class SupConLoss(nn.Module):
 |ModernBERT_unsloth | 0.95860  |
 | bert_scratch_lora      | 0.92396 |
 | bert_scl_lora    | 0.92092  |
+
+
+
+## 5. 大语言模型指令学习评估
+在本节任务中，使用了以下大语言模型：
+deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+Qwen/Qwen2.5-3B-Instruct
+google/gemma-2-2b-it
+microsoft/Phi-3.5-mini-instruct
+mistralai/Mistral-7B-Instruct-v0.3
+TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+由于测试集较大,逐条分析时会出现超出内存的情况,同时会出现训练时间超出最大训练时间的情况，对此采取以下措施得以解决：
+换用参数量更小的模型，例如将deepseek-ai/DeepSeek-R1-Distill-Llama-8B模型换为deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B模型
+通过 “少样本提示 ” 强行要求模型跳过思考过程，直接输出答案，不用再去切分 <think> 标签，结果就是纯数字，在此解决措施下，batchsize可以大幅提升，训练速度得以大幅提升
+
+
+
+
+**prompt:**
+~~~
+# 在 Prompt 里直接给出 3 个例子 (2正1负)，并不加 <think> 标签
+# 这样模型会模仿上面的格式，直接输出 0 或 1
+few_shot_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Analyze the IMDb movie review and determine the sentiment polarity.
+Return 1 for positive, 0 for negative. Output ONLY the number.
+
+### Input:
+I loved this movie! It was fantastic and the acting was great.
+### Response:
+1
+
+### Input:
+This was the worst film I have ever seen. Boring and terrible plot.
+### Response:
+0
+
+### Input:
+A masterpiece of cinema, truly touching and beautiful.
+### Response:
+1
+
+### Input:
+{review_text}
+### Response:
+"""
+~~~
+
+注：部分模型需要申请 Hugging Face Token 并在网页签署协议，否则会报 403/401 错误
+
+
+
+## 各模型准确率
+| 模型        | 准确率    |
+|------------------|-----------|
+|DeepSeek-R1    | 0.73460 |
+| Qwen2.5|  0.89024 |
+| gemma-2|  0.89108 |
+| Phi-3.5    | 0.92120  |
+|Mistral-7B    | 0.92012 |
+| TinyLlama-1.1B    | 0.63280  |
